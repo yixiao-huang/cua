@@ -186,6 +186,21 @@ class OpenClawComputerAgent(ComputerAgent):
                     only_n_most_recent_images=cb.only_n_most_recent_images
                 )
 
+        # Same pattern for TrajectorySaverCallback — swap the auto-added SDK
+        # variant for the OpenClaw subclass, which overrides ``on_responses``
+        # to skip the turn-bump that bloats trajectory dirs in the function-
+        # call shim path. Removes the need for orchestration's
+        # ``__init__.py`` to monkey-patch ``agent.agent.TrajectorySaverCallback``.
+        from agent.callbacks.trajectory_saver import TrajectorySaverCallback as _SDKTrajectorySaver
+        from .adapters.trajectory_saver import OpenClawTrajectorySaverCallback
+        for i, cb in enumerate(self.callbacks):
+            if type(cb) is _SDKTrajectorySaver:
+                self.callbacks[i] = OpenClawTrajectorySaverCallback(
+                    trajectory_dir=str(cb.trajectory_dir),
+                    reset_on_run=cb.reset_on_run,
+                    screenshot_dir=str(cb.screenshot_dir) if cb.screenshot_dir else None,
+                )
+
         self.overflow_cb = overflow_cb
         self.session_mgr = session_mgr
         self.memory_store = memory_store

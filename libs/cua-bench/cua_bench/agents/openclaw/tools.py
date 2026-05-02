@@ -166,6 +166,7 @@ def build_tools(
     workspace_root: str | None = None,
     host_workspace_root: str | None = None,
     context_window_tokens: int | None = None,
+    computer_handler: Any = None,
 ) -> list:
     """Assemble the canonical tool list for the OpenClaw agent.
 
@@ -268,6 +269,13 @@ def build_tools(
 
     if disable_main_computer:
         computer = _RestrictedComputerHandler(session._computer)
+    elif computer_handler is not None:
+        # Caller pre-built and initialized an AsyncComputerHandler (e.g. an
+        # OpenClawComputerHandler with custom ``keypress`` semantics). Pass it
+        # through so upstream's ``make_computer_handler`` returns it as-is on
+        # the ``isinstance(_, AsyncComputerHandler)`` check, avoiding the need
+        # for orchestration to monkey-patch ``agent.computers.cuaComputerHandler``.
+        computer = computer_handler
     else:
         computer = session._computer
 
