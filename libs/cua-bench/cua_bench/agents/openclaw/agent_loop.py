@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from agent.agent import ComputerAgent, assert_callable_with, get_json, get_output_call_ids
@@ -107,25 +108,43 @@ def _rewrite_input_image_to_image_url(items: List[Dict[str, Any]]) -> List[Dict[
     return items
 
 
+# Matches the convention documented in the agent's AGENTS.md:
+# "When you have fully completed the task, output **DONE** on its own line."
+# Naive `"DONE" in text` produced false positives on incidental mentions
+# like `"JOB DONE"` in log/output discussion, ending runs mid-task.
+# Mirrors `_TEXT_DONE_RE` in subagent_gui_protocol.py (the GUI subagent's
+# strict matcher) but tolerates surrounding asterisks for `**DONE**`.
+_DONE_LINE_RE = re.compile(
+    r"^\s*\**DONE\**(?:[:\s]+(.*))?$", re.IGNORECASE
+)
+
+
 def has_done_signal(output: List[Dict[str, Any]]) -> bool:
     """Return True if the assistant output contains the DONE completion signal.
 
     Single source of truth for OpenClaw's task-completion detection. Used by
     both the inner agent loop (to break the generator) and the outer
     OpenClawAgent.perform_task consumer (to classify the run as completed).
+
+    Matches DONE only when it appears as its own line (optionally bolded or
+    followed by `: <summary>`) — incidental mentions like "JOB DONE" inside
+    a sentence do NOT terminate the run.
     """
+    def _line_matches(text: str) -> bool:
+        return any(_DONE_LINE_RE.match(line) for line in text.splitlines())
+
     for item in output:
         if item.get("type") != "message":
             continue
         content = item.get("content", "")
         if isinstance(content, str):
-            if "DONE" in content:
+            if _line_matches(content):
                 return True
-        elif isinstance(content, list) and content:
-            first = content[0]
-            text = first.get("text", "") if isinstance(first, dict) else str(first)
-            if "DONE" in text:
-                return True
+        elif isinstance(content, list):
+            for block in content:
+                text = block.get("text", "") if isinstance(block, dict) else str(block)
+                if text and _line_matches(text):
+                    return True
     return False
 
 
