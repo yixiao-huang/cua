@@ -559,6 +559,26 @@ class OpenClawComputerAgent(ComputerAgent):
             return await self._dispatch_function_call(item, computer)
         except ToolError as e:
             return [make_tool_error_item(repr(e), call_id)]
+        except (json.JSONDecodeError, TypeError) as e:
+            # Tool-call arguments were not valid JSON. The most common cause is
+            # the upstream provider truncating the streamed tool_call payload
+            # mid-write (e.g. Bedrock 502 mid-stream during a large `write`).
+            # Surface this back to the model as a tool_error so the agent can
+            # retry on the next turn instead of crashing the run loop.
+            tool_name = item.get("name", "<unknown>")
+            raw_args = item.get("arguments")
+            snippet = (
+                raw_args[:200] + "..."
+                if isinstance(raw_args, str) and len(raw_args) > 200
+                else raw_args
+            )
+            error_message = (
+                f"Malformed tool-call arguments for {tool_name!r} "
+                f"(likely truncated by upstream provider): {e!r}. "
+                f"Raw arguments: {snippet!r}. "
+                f"Please retry the call with complete arguments."
+            )
+            return [make_tool_error_item(error_message, call_id)]
 
     async def _dispatch_function_call(
         self,
