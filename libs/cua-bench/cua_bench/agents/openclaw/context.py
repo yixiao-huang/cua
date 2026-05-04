@@ -311,6 +311,15 @@ class ContextOverflowCallback(AsyncCallbackHandler):
         return self._context_window
 
     @property
+    def compaction_threshold_ratio(self) -> float:
+        """Fraction of ``context_window`` at which compaction is triggered.
+
+        Exposed so the memory-flush threshold can be anchored to the same
+        boundary (flush must fire before compaction).
+        """
+        return self._threshold
+
+    @property
     def needs_compaction(self) -> bool:
         """Whether estimated usage exceeds the threshold."""
         return self._needs_compaction

@@ -517,25 +517,44 @@ DEFAULT_MEMORY_FLUSH_SOFT_THRESHOLD_TOKENS = 4000
 DEFAULT_MEMORY_FLUSH_RESERVE_TOKENS_FLOOR = 20_000
 
 
+DEFAULT_COMPACTION_RATIO = 0.80
+
+
 def should_run_memory_flush(
     state: SessionState,
     *,
     current_tokens: int,
     context_window: int,
+    compaction_ratio: float = DEFAULT_COMPACTION_RATIO,
     soft_threshold_tokens: int = DEFAULT_MEMORY_FLUSH_SOFT_THRESHOLD_TOKENS,
     reserve_tokens: int = DEFAULT_MEMORY_FLUSH_RESERVE_TOKENS_FLOOR,
 ) -> bool:
     """Determine whether a pre-compaction memory flush should run.
 
-    The flush triggers when token usage exceeds (context_window - reserve - soft_threshold)
-    AND no flush has occurred in the current compaction cycle.
+    The flush must fire BEFORE compaction. agenthle's compaction is proactive
+    at ``compaction_ratio * context_window`` (default 80%), so the flush
+    threshold is anchored to the compaction trigger — not the raw context
+    window — with ``reserve + soft_threshold`` of headroom below it. With the
+    defaults that's a 24K-token cushion, large enough for the flush turn's own
+    completion plus a step or two of slack.
+
+    For a 200K window @ 0.80: compaction at 160K, flush at 136K (24K cushion).
+    For a 1M window  @ 0.80: compaction at 800K, flush at 776K (24K cushion).
+
+    Pass ``compaction_ratio=1.0`` to recover OpenClaw's original semantics
+    (flush anchored to the absolute context window edge), which is correct
+    only when compaction also fires at the literal limit.
 
     Based on OpenClaw's shouldRunMemoryFlush()
-    (openclaw/src/auto-reply/reply/memory-flush.ts:124-169).
+    (openclaw/src/auto-reply/reply/memory-flush.ts:124-169), adapted because
+    agenthle compacts at a ratio rather than at the absolute edge.
     """
     if current_tokens <= 0:
         return False
-    threshold = max(0, context_window - reserve_tokens - soft_threshold_tokens)
+    if compaction_ratio <= 0 or compaction_ratio > 1:
+        return False
+    compaction_trigger = int(context_window * compaction_ratio)
+    threshold = max(0, compaction_trigger - reserve_tokens - soft_threshold_tokens)
     if threshold <= 0:
         return False
     if current_tokens < threshold:

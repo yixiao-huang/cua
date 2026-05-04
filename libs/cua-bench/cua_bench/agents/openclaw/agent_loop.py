@@ -477,6 +477,7 @@ class OpenClawComputerAgent(ComputerAgent):
             self.session_mgr._state,
             current_tokens=self.overflow_cb.current_tokens,
             context_window=self.overflow_cb.context_window,
+            compaction_ratio=self.overflow_cb.compaction_threshold_ratio,
         ):
             return
         await run_memory_flush(
