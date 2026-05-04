@@ -9,6 +9,28 @@ US-OC-017: Uses OpenClawComputerAgent subclass for mid-loop compaction instead o
 the stop-compact-resume pattern. Compaction happens in-place inside run() — no
 agent rebuild needed.
 
+Subclassing surface (US-OC-073):
+  Wrappers that need to specialize behavior (e.g. orchestration's
+  ``openclaw-cua`` adapter that nests logs under ``origin_log/``, pre-builds a
+  custom computer handler, writes an interaction log, etc.) should subclass
+  ``OpenClawAgent`` and override the protected hooks below rather than
+  recreating ``perform_task`` from scratch. This prevents the wrapper from
+  silently drifting when fixes land here:
+
+    - ``_AGENT_CLASS``                 — agent class to instantiate
+    - ``_LOOP_EXIT_FAILURE_MODE``      — failure mode for loop exit w/o done-signal
+    - ``_default_lightweight_model``   — auto-sibling lookup for ``lightweight_model``
+    - ``_default_summary_model``       — fallback when ``summary_model`` kwarg absent
+    - ``_default_gui_model``           — fallback when ``gui_model`` kwarg absent
+    - ``_resolve_paths``               — trajectory_dir / memory_base / session_base / task_id
+    - ``_resolve_workspace_root``      — VM workspace root for FS tools
+    - ``_make_computer_handler``       — pre-built CUA computer handler (else auto)
+    - ``_filter_tools``                — post-filter on tool list (e.g. disabled_tools)
+    - ``_after_run_finally``           — finalization hook (log writers, etc.)
+
+  Subclasses re-register under their own name via ``@register_agent(...)``;
+  the upstream ``"openclaw-agent"`` registration here is independent.
+
 References:
   - docs/openclaw-source-analysis.md — OpenClaw source code analysis
   - docs/openclaw-context-flow.html — interactive visual pipeline
@@ -16,16 +38,16 @@ References:
   - architecture.md — AgentHLE system architecture
 """
 
+import os
 import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-from .openclaw.model_config import resolve_model
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from . import register_agent
 from .base import AgentResult, BaseAgent, FailureMode
-from .openclaw.agent_loop import has_done_signal
-
+from .openclaw.agent_loop import OpenClawComputerAgent, has_done_signal
+from .openclaw.model_config import resolve_model
 
 if TYPE_CHECKING:
     from ..computers import DesktopSession
@@ -58,13 +80,26 @@ def _derive_lightweight_model(model: str) -> str | None:
 
 @register_agent("openclaw-agent")
 class OpenClawAgent(BaseAgent):
-    """OpenClaw agent reproduction for CUA benchmark framework."""
+    """OpenClaw agent reproduction for CUA benchmark framework.
+
+    Subclasses can override the ``_*`` hook methods listed in the module
+    docstring to specialize behavior without recreating ``perform_task``.
+    """
+
+    # ------------------------------------------------------------------
+    # Subclass-overridable surface (see module docstring)
+    # ------------------------------------------------------------------
+    _AGENT_CLASS: ClassVar[type] = OpenClawComputerAgent
+
+    # FailureMode reported when the agent loop exits without a done-signal
+    # AND without hitting max_steps. Upstream treats this as success
+    # (NONE); some wrappers want UNKNOWN so eval metrics don't conflate
+    # this with a real success.
+    _LOOP_EXIT_FAILURE_MODE: ClassVar[FailureMode] = FailureMode.NONE
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.model = kwargs.get("model", "openrouter/anthropic/claude-sonnet-4-20250514")
-        # Separate model for summarization and memory flush (defaults to main model)
-        self.summary_model = kwargs.get("summary_model", None) or self.model
         self.max_steps = kwargs.get("max_steps", 100)
         self.max_history_turns = kwargs.get("max_history_turns", None)  # None = all
         # When True, the main agent has no direct ``computer`` tool — all GUI
@@ -80,23 +115,30 @@ class OpenClawAgent(BaseAgent):
                 "Both disable_main_computer and disable_delegate_gui set — "
                 "the agent has no way to interact with the VM."
             )
-        self.gui_model = kwargs.get("gui_model", None)
-        # Image retention mode (US-OC-072). "count" (default) keeps last N
-        # images; "turn" keeps all images from last N completed turns
-        # (OpenClaw-parity). Both modes use sticky placeholder replacement.
-        self.image_retention_mode = kwargs.get("image_retention_mode", "count")
+        # Image retention mode (US-OC-072). "openclaw" (default) keeps all
+        # images from last N completed turns (OpenClaw-parity); "cua" keeps
+        # last N images by count (CUA-default). Both modes use sticky
+        # placeholder replacement. Default flipped from "count" to "openclaw"
+        # after on-task verification (cache-thrash-image-retention.md).
+        self.image_retention_mode = kwargs.get("image_retention_mode", "openclaw")
         # Optional lightweight sibling exposed to delegate tools as the
-        # second enum option. Explicit override wins; otherwise derive from
-        # ``self.model`` (e.g. ``…/gpt-5.4`` → ``…/gpt-5.4-mini``). Returns
-        # ``None`` for model families with no obvious sibling.
-        self.lightweight_model = (
-            kwargs.get("lightweight_model")
-            or _derive_lightweight_model(self.model)
+        # second enum option. Explicit override wins; otherwise resolve via
+        # the ``_default_lightweight_model`` hook.
+        self.lightweight_model = kwargs.get("lightweight_model") or self._default_lightweight_model(
+            self.model
         )
+        # Separate model for summarization and memory flush. Explicit override
+        # wins; otherwise resolve via the ``_default_summary_model`` hook
+        # (subclasses can default to ``lightweight_model`` for cost savings).
+        self.summary_model = kwargs.get("summary_model") or self._default_summary_model()
+        # GUI subagent model. Explicit override wins; otherwise resolve via
+        # the ``_default_gui_model`` hook.
+        self.gui_model = kwargs.get("gui_model") or self._default_gui_model()
 
         # Thinking level configuration (US-OC-019)
         # CLI --thinking-level overrides auto-detection; omitting uses model default.
-        from .openclaw.thinking import ThinkLevel, ThinkingConfig, resolve_thinking_default
+        from .openclaw.thinking import (ThinkingConfig, ThinkLevel,
+                                        resolve_thinking_default)
 
         thinking_level_str = kwargs.get("thinking_level")
         if thinking_level_str is not None:
@@ -109,20 +151,12 @@ class OpenClawAgent(BaseAgent):
         gui_level_str = kwargs.get("gui_thinking_level")
         flush_level = ThinkLevel(flush_level_str) if flush_level_str is not None else level
         compaction_level = (
-            ThinkLevel(compaction_level_str)
-            if compaction_level_str is not None
-            else level
+            ThinkLevel(compaction_level_str) if compaction_level_str is not None else level
         )
         vision_level = (
-            ThinkLevel(vision_level_str)
-            if vision_level_str is not None
-            else ThinkLevel.OFF
+            ThinkLevel(vision_level_str) if vision_level_str is not None else ThinkLevel.OFF
         )
-        gui_level = (
-            ThinkLevel(gui_level_str)
-            if gui_level_str is not None
-            else ThinkLevel.OFF
-        )
+        gui_level = ThinkLevel(gui_level_str) if gui_level_str is not None else ThinkLevel.OFF
         self.thinking_config = ThinkingConfig(
             level=level,
             flush_level=flush_level,
@@ -135,6 +169,98 @@ class OpenClawAgent(BaseAgent):
     def name() -> str:
         return "openclaw-agent"
 
+    # ------------------------------------------------------------------
+    # Hook defaults
+    # ------------------------------------------------------------------
+
+    def _default_lightweight_model(self, model: str) -> str | None:
+        """Map ``model`` to a cheaper sibling, or None when none is registered."""
+        return _derive_lightweight_model(model)
+
+    def _default_summary_model(self) -> str:
+        """Fallback when ``summary_model`` kwarg is absent. Defaults to main model."""
+        return self.model
+
+    def _default_gui_model(self) -> str | None:
+        """Fallback when ``gui_model`` kwarg is absent. Defaults to None (= main model)."""
+        return None
+
+    def _resolve_paths(self, logging_dir: Path | None) -> dict[str, Any]:
+        """Resolve filesystem layout for this run.
+
+        Returns a dict with:
+          - ``trajectory_dir``: where per-turn API payloads are written.
+          - ``memory_base``:    base dir for ``MemoryStore`` (None → default).
+          - ``session_base``:   base dir for ``SessionManager`` (None → default).
+          - ``task_id``:        memory/session keying string.
+
+        Default: trajectories sit under ``logging_dir/trajectories``, memory and
+        session use upstream defaults, ``task_id`` is the parent directory
+        name. Subclasses can nest under ``origin_log/``, wipe-on-entry, walk
+        the path for a smarter task_id, etc.
+        """
+        if logging_dir is None:
+            return {
+                "trajectory_dir": None,
+                "memory_base": None,
+                "session_base": None,
+                "task_id": "default",
+            }
+        trajectory_dir = logging_dir / "trajectories"
+        trajectory_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "trajectory_dir": trajectory_dir,
+            "memory_base": None,
+            "session_base": None,
+            "task_id": logging_dir.parent.name,
+        }
+
+    def _resolve_workspace_root(self, session: "DesktopSession") -> str | None:
+        """Workspace root passed to FS tools. None → permissive (no bound).
+
+        Default: Windows-style path under ``REMOTE_ROOT_DIR`` /
+        ``TASK_CATEGORY`` / ``TASK_TAG`` (matches the Windows VM image used
+        for CUA bench tasks). When ``TASK_TAG`` is unset, returns None.
+        Subclasses can detect Linux vs Windows etc.
+        """
+        task_tag = os.environ.get("TASK_TAG", "").strip()
+        if not task_tag:
+            return None
+        root_dir = os.environ.get("REMOTE_ROOT_DIR", r"C:\Users\User\Desktop")
+        category = os.environ.get("TASK_CATEGORY", "tasks")
+        return f"{root_dir}\\{category}\\{task_tag}"
+
+    def _make_computer_handler(self, session: "DesktopSession"):
+        """Optional pre-built computer handler passed to ``build_tools``.
+
+        Default: return None — let ``build_tools`` auto-instantiate the
+        upstream CUA handler. Subclasses can return a pre-initialized
+        custom ``AsyncComputerHandler`` (avoids module-level monkey-patches).
+        """
+        return None
+
+    def _filter_tools(self, tools: list) -> list:
+        """Optional post-filter on the assembled tool list. Default: identity."""
+        return tools
+
+    def _after_run_finally(
+        self,
+        *,
+        logging_dir: Path | None,
+        instruction: str,
+        total_usage: dict,
+        started_at: float,
+    ) -> None:
+        """Finalization hook called from ``perform_task``'s ``finally``.
+
+        Default: no-op. Subclasses can write an interaction log, sync
+        artifacts, etc. Always called, even if the agent raises.
+        """
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
     async def perform_task(
         self,
         task_description: str,
@@ -142,65 +268,50 @@ class OpenClawAgent(BaseAgent):
         logging_dir: Path | None = None,
         tracer=None,
     ) -> AgentResult:
-        """
-        Perform a task using the OpenClawComputerAgent with mid-loop compaction.
+        """Perform a task using the OpenClawComputerAgent with mid-loop compaction.
 
-        Uses OpenClawComputerAgent (US-OC-017) which handles compaction in-place
-        inside run() — no stop-compact-resume pattern needed.
-
-        Args:
-            task_description: The task description/instruction
-            session: The desktop session to interact with
-            logging_dir: Optional directory for logging agent execution
-            tracer: Optional tracer object for recording agent actions
-
-        Returns:
-            AgentResult with token counts and failure mode
+        Uses ``OpenClawComputerAgent`` (US-OC-017) which handles compaction
+        in-place inside ``run()`` — no stop-compact-resume pattern needed.
         """
         try:
-            from agent import ComputerAgent  # noqa: F401 — validate package is installed
+            from agent import \
+                ComputerAgent  # noqa: F401 — validate package is installed
         except ImportError as e:
             raise RuntimeError(
-                "openclaw-agent requires the CUA `agent` package. "
-                "Run: uv sync --reinstall"
+                f"{self.name()} requires the CUA `agent` package. " "Run: uv sync --reinstall"
             ) from e
 
-        # Render instruction with template if provided
         instruction = self._render_instruction(task_description)
 
-        # Create trajectory directory if logging_dir is provided
-        trajectory_dir = None
-        if logging_dir:
-            trajectory_dir = logging_dir / "trajectories"
-            trajectory_dir.mkdir(parents=True, exist_ok=True)
+        # Filesystem layout (subclass-controlled).
+        paths = self._resolve_paths(logging_dir)
+        trajectory_dir: Path | None = paths.get("trajectory_dir")
+        memory_base = paths.get("memory_base")
+        session_base = paths.get("session_base")
+        task_id: str = paths.get("task_id") or "default"
 
         # Build structured system prompt via PromptBuilder (US-OC-001)
-        from .openclaw import (
-            ContextFile,
-            ContextOverflowCallback,
-            MemoryStore,
-            OpenClawComputerAgent,
-            PromptBuilder,
-            SessionManager,
-            SubagentRegistry,
-            ToolLoggingCallback,
-            build_replay_messages,
-            build_system_prompt_report,
-            build_tools,
-            convert_to_responses_api_items,
-            get_tool_summaries,
-            limit_history_turns,
-            sanitize_history,
-        )
+        from .openclaw import (ContextFile, ContextOverflowCallback,
+                               MemoryStore, PromptBuilder, SessionManager,
+                               SubagentRegistry, ToolLoggingCallback,
+                               build_replay_messages,
+                               build_system_prompt_report, build_tools,
+                               convert_to_responses_api_items,
+                               get_tool_summaries, limit_history_turns,
+                               sanitize_history)
 
-        # Initialize memory store (US-OC-002)
-        # Derive task_id from logging_dir name or fall back to "default"
-        task_id = logging_dir.parent.name if logging_dir else "default"
-        memory_store = MemoryStore(task_id=task_id)
+        # Initialize memory store (US-OC-002).
+        if memory_base is not None:
+            memory_store = MemoryStore(task_id=task_id, base_dir=memory_base)
+        else:
+            memory_store = MemoryStore(task_id=task_id)
         memory_store.init_session()
 
-        # Initialize session persistence (US-OC-004)
-        session_mgr = SessionManager(task_id=task_id)
+        # Initialize session persistence (US-OC-004).
+        if session_base is not None:
+            session_mgr = SessionManager(task_id=task_id, base_dir=session_base)
+        else:
+            session_mgr = SessionManager(task_id=task_id)
         session_mgr.init_session(model=self.model)
 
         # Cross-run continuity (US-OC-012): replay prior transcript as messages
@@ -220,7 +331,9 @@ class OpenClawAgent(BaseAgent):
 
         resolved_model = resolve_model(self.model)
         resolved_summary_model = (
-            resolved_model if self.summary_model == self.model else resolve_model(self.summary_model)
+            resolved_model
+            if self.summary_model == self.model
+            else resolve_model(self.summary_model)
         )
 
         # Subagent registry (US-SUB-005/007) — disk-backed when session is active.
@@ -231,8 +344,9 @@ class OpenClawAgent(BaseAgent):
         # Resolve context window up-front so tools (adaptive paging in
         # ReadFileTool) and the later ContextOverflowCallback share the
         # same number. Honors CONTEXT_WINDOW_OVERRIDE for testing.
-        import os
-        from .openclaw.context import DEFAULT_CONTEXT_TOKENS, resolve_context_window
+        from .openclaw.context import (DEFAULT_CONTEXT_TOKENS,
+                                       resolve_context_window)
+
         ctx_override = os.environ.get("CONTEXT_WINDOW_OVERRIDE")
         if ctx_override:
             context_window_tokens = int(ctx_override)
@@ -243,15 +357,8 @@ class OpenClawAgent(BaseAgent):
                 or DEFAULT_CONTEXT_TOKENS
             )
 
-        # Workspace root for FS-tool path policy (US-OC-055). Derived from
-        # GeneralTaskConfig-style env vars; None → permissive mode.
-        task_tag = os.environ.get("TASK_TAG", "").strip()
-        if task_tag:
-            root_dir = os.environ.get("REMOTE_ROOT_DIR", r"C:\Users\User\Desktop")
-            category = os.environ.get("TASK_CATEGORY", "tasks")
-            workspace_root: str | None = f"{root_dir}\\{category}\\{task_tag}"
-        else:
-            workspace_root = None
+        # Workspace root for FS-tool path policy (US-OC-055).
+        workspace_root = self._resolve_workspace_root(session)
 
         # Host workspace root for `target='host'` on read/write/edit. Operator
         # override via OPENCLAW_HOST_WORKSPACE; otherwise pin per-task to the
@@ -269,6 +376,18 @@ class OpenClawAgent(BaseAgent):
         thinking_api_params = self.thinking_config.to_api_params(self.model)
         gui_model_str = self.gui_model or self.model
         gui_thinking_params = self.thinking_config.gui_params(gui_model_str)
+
+        # Pre-built computer handler (subclass-controlled). When None,
+        # build_tools auto-instantiates the upstream CUA handler.
+        computer_handler = None
+        if not self.disable_main_computer:
+            computer_handler = self._make_computer_handler(session)
+            if computer_handler is not None and hasattr(computer_handler, "_initialize"):
+                # Pre-initialize so build_tools' isinstance() short-circuit
+                # accepts it (the SDK's make_computer_handler() returns
+                # AsyncComputerHandler instances as-is).
+                await computer_handler._initialize()
+
         tools = build_tools(
             session,
             memory_store,
@@ -289,11 +408,18 @@ class OpenClawAgent(BaseAgent):
             workspace_root=workspace_root,
             host_workspace_root=host_workspace_root,
             context_window_tokens=context_window_tokens,
+            computer_handler=computer_handler,
         )
+        tools = self._filter_tools(tools)
         tool_summaries = get_tool_summaries(tools)
-        agents_md = (Path(__file__).parent / "openclaw" / "AGENTS.md").read_text()
 
-        # Build context files, injecting TASK_MEMORY.md if it exists
+        # AGENTS.md ships next to the openclaw subpackage. Locate via the
+        # imported package so wrappers don't need to know the path.
+        from . import openclaw as _openclaw_pkg
+
+        agents_md = (Path(_openclaw_pkg.__file__).parent / "AGENTS.md").read_text()
+
+        # Build context files, injecting TASK_MEMORY.md if it exists.
         # Note: task description is NOT injected here — it's passed separately
         # via agent.run(instruction) to avoid duplication in context.
         context_files = [
@@ -301,9 +427,7 @@ class OpenClawAgent(BaseAgent):
         ]
         bootstrap = memory_store.get_bootstrap_context()
         if bootstrap:
-            context_files.append(
-                ContextFile(path="TASK_MEMORY.md", content=bootstrap)
-            )
+            context_files.append(ContextFile(path="TASK_MEMORY.md", content=bootstrap))
 
         builder = PromptBuilder()
         instructions = builder.build(
@@ -321,8 +445,6 @@ class OpenClawAgent(BaseAgent):
         session_mgr.set_system_prompt_report(report)
 
         # Context overflow detection (US-OC-005).
-        # context_window_tokens was resolved above for FS-tool adaptive paging;
-        # reuse it here so the callback and the tools agree on the number.
         overflow_cb = ContextOverflowCallback(
             model=self.model,
             context_window=context_window_tokens,
@@ -342,7 +464,7 @@ class OpenClawAgent(BaseAgent):
         # use_prompt_caching=True trips the gate in
         # ``UnifiedAgentConfig.predict_step`` that calls
         # ``apply_openclaw_cache_markers`` on Anthropic-family models.
-        agent = OpenClawComputerAgent(
+        agent = self._AGENT_CLASS(
             # ComputerAgent params
             model=self.model,
             tools=tools,
@@ -374,8 +496,12 @@ class OpenClawAgent(BaseAgent):
             **thinking_api_params,
         )
         print("OpenClaw Agent initialized with model:", self.model)
+        if self.lightweight_model:
+            print("  Lightweight model:", self.lightweight_model)
         if self.summary_model != self.model:
             print("  Summary/flush model:", self.summary_model)
+        if self.gui_model and self.gui_model != self.model:
+            print("  GUI subagent model:", self.gui_model)
         if self.disable_main_computer:
             print("  Main computer tool DISABLED — GUI work must go through delegate_gui")
         if self.disable_delegate_gui:
@@ -390,19 +516,26 @@ class OpenClawAgent(BaseAgent):
             print("  Vision thinking level:", self.thinking_config.vision_level.value)
         if self.thinking_config.gui_level.value != "off":
             print("  GUI thinking level:", self.thinking_config.gui_level.value)
+        # Always print the resolved mode so users can confirm which threshold
+        # is in effect — both have meaningful trade-offs and the default
+        # changed at US-OC-072 verification time.
+        print(f"  Image retention mode: {self.image_retention_mode}")
 
-        # Single-loop execution (US-OC-017)
+        # Hoist out of the try so the finally block can pass them to the
+        # finalization hook even if the agent raises before assigning.
+        total_usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "response_cost": 0.0,
+        }
+        agent_run_start = time.time()
+
+        # Single-loop execution (US-OC-017).
         # Compaction happens in-place inside OpenClawComputerAgent.run() — no
         # stop-compact-resume pattern needed. Reactive overflow is also handled
         # inside the custom run() via try/except around predict_step().
         try:
-            total_usage = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "response_cost": 0.0,
-            }
-
             step = 0
             step_offset = session_mgr.get_step_count()
             task_completed = False
@@ -430,7 +563,9 @@ class OpenClawAgent(BaseAgent):
 
                 # Tracer recording (optional)
                 if tracer:
-                    await _record_tracer_step(tracer, session, step, self.model, result)
+                    await _record_tracer_step(
+                        tracer, session, step, self.name(), self.model, result
+                    )
 
                 if step >= self.max_steps:
                     print(f"\n[Max steps reached] Stopped at step {step}/{self.max_steps}")
@@ -452,7 +587,7 @@ class OpenClawAgent(BaseAgent):
             elif step >= self.max_steps:
                 failure_mode = FailureMode.MAX_STEPS_EXCEEDED
             else:
-                failure_mode = FailureMode.NONE  # Completed within max_steps
+                failure_mode = self._LOOP_EXIT_FAILURE_MODE
 
             return AgentResult(
                 total_input_tokens=total_usage.get("input_tokens", 0),
@@ -469,10 +604,18 @@ class OpenClawAgent(BaseAgent):
                 total_output_tokens=total_usage.get("output_tokens", 0),
                 failure_mode=FailureMode.UNKNOWN,
             )
+        finally:
+            self._after_run_finally(
+                logging_dir=logging_dir,
+                instruction=instruction,
+                total_usage=total_usage,
+                started_at=agent_run_start,
+            )
 
 
-
-async def _record_tracer_step(tracer, session, step: int, model: str, result: dict) -> None:
+async def _record_tracer_step(
+    tracer, session, step: int, agent_name: str, model: str, result: dict
+) -> None:
     """Record an agent step to the tracer (optional observability)."""
     try:
         screenshot = await session.screenshot()
@@ -480,7 +623,7 @@ async def _record_tracer_step(tracer, session, step: int, model: str, result: di
             "agent_step",
             {
                 "step": step,
-                "agent": "openclaw-agent",
+                "agent": agent_name,
                 "model": model,
                 "usage": result["usage"],
                 "output": result["output"],
@@ -489,5 +632,3 @@ async def _record_tracer_step(tracer, session, step: int, model: str, result: di
         )
     except Exception as e:
         print(f"Warning: Failed to record agent step to tracer: {e}")
-
-
