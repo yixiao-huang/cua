@@ -176,6 +176,11 @@ class OpenClawComputerAgent(ComputerAgent):
         registry: SubagentRegistry | None = None,
         auto_screenshot: bool = False,
         context_files: Optional[List[ContextFile]] = None,
+        # Image retention mode (US-OC-072): "count" preserves the CUA-default
+        # last-N-images budget; "turn" switches to OpenClaw-parity last-N-
+        # completed-turns. Both modes use sticky placeholder replacement
+        # (no message-deletion cache thrash).
+        image_retention_mode: str = "count",
         **kwargs,  # Pass through to ComputerAgent
     ):
         # Auto-inject overflow_cb into callbacks (US-OC-028)
@@ -204,7 +209,8 @@ class OpenClawComputerAgent(ComputerAgent):
         for i, cb in enumerate(self.callbacks):
             if type(cb) is _SDKImageRetention:
                 self.callbacks[i] = OpenClawImageRetentionCallback(
-                    only_n_most_recent_images=cb.only_n_most_recent_images
+                    only_n_most_recent_images=cb.only_n_most_recent_images,
+                    mode=image_retention_mode,
                 )
 
         # Same pattern for TrajectorySaverCallback — swap the auto-added SDK

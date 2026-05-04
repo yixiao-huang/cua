@@ -81,6 +81,10 @@ class OpenClawAgent(BaseAgent):
                 "the agent has no way to interact with the VM."
             )
         self.gui_model = kwargs.get("gui_model", None)
+        # Image retention mode (US-OC-072). "count" (default) keeps last N
+        # images; "turn" keeps all images from last N completed turns
+        # (OpenClaw-parity). Both modes use sticky placeholder replacement.
+        self.image_retention_mode = kwargs.get("image_retention_mode", "count")
         # Optional lightweight sibling exposed to delegate tools as the
         # second enum option. Explicit override wins; otherwise derive from
         # ``self.model`` (e.g. ``…/gpt-5.4`` → ``…/gpt-5.4-mini``). Returns
@@ -350,6 +354,8 @@ class OpenClawAgent(BaseAgent):
             # Re-injected as a user message after each compaction (US-OC-070
             # post-compaction context refresh — mirrors OpenClaw default).
             context_files=context_files,
+            # US-OC-072 — see OpenClawComputerAgent docstring for modes.
+            image_retention_mode=self.image_retention_mode,
             # Only the explicit ``screenshot`` action returns an image —
             # click/type/keypress/etc. return their tool result as text.
             auto_screenshot=False,

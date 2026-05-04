@@ -1,6 +1,6 @@
 """E — ImageRetentionCallback extensions for the openclaw harness.
 
-Two extensions on top of the SDK's ``ImageRetentionCallback``:
+Three extensions on top of the SDK's ``ImageRetentionCallback``:
 
 1. **call_id-based pairing** (legacy back-port for SDK pins predating the
    openclaw fork). The SDK assumed the ``computer_call`` that produced a
@@ -18,22 +18,61 @@ Two extensions on top of the SDK's ``ImageRetentionCallback``:
    user message* with ``image_url`` / ``input_image`` content blocks,
    not inside any ``*_output`` item. The SDK retention silently no-ops
    for that path. This subclass also walks user-message content lists,
-   strips older image blocks, and drops messages whose content becomes
-   empty after stripping.
+   strips older image blocks, and replaces them with a stable text
+   placeholder when the message is image-only.
 
-   Unlike the native path (where the screenshot is the entire output, so
-   removing it requires removing the producing ``computer_call`` too),
-   the shim path's text status (``function_call_output``) is independent
-   of the screenshot. We strip just the image and keep the action +
-   status text, preserving the agent's audit trail of what it tried
-   while shedding the heavy ~1.2K-token image.
+3. **Sticky placeholder + optional turn-based mode** (US-OC-072).
+   When the SDK's per-block strip empties a user message, the original
+   behavior dropped the message entirely. That deletion shifts every
+   subsequent message index, busting Anthropic's prefix cache from the
+   deletion point onward — verified at ~45% cache hit rate on
+   GUI-heavy tasks (see cache-thrash-image-retention.md). Fix:
+
+   - **Sticky placeholder (always on)**: replace the image with a fixed
+     text block (`PRUNED_HISTORY_IMAGE_MARKER`). The placeholder is
+     byte-stable across calls, so a given message gets mutated at most
+     once (when its image ages out). After that mutation, the placeholder
+     becomes part of the cached prefix on subsequent turns. Cache prefix
+     extension recovers from "pinned at system prompt" to monotonic.
+
+   - **Mode = "count" (default)**: original CUA behavior — keep the last
+     ``only_n_most_recent_images`` images. Each new image past the
+     budget ages out the oldest one.
+
+   - **Mode = "turn" (opt-in)**: OpenClaw-style — keep all images from
+     the last ``only_n_most_recent_images`` *completed turns*. A turn
+     boundary is a transition into an assistant/tool-emitting message.
+     Mirrors ``pruneProcessedHistoryImages`` in
+     ``openclaw/src/agents/pi-embedded-runner/run/history-image-prune.ts``.
+     Better for multi-screenshot turns (keeps the cluster intact);
+     drops older images sooner if turns interleave with no-screenshot
+     turns.
+
+   Native ``computer_call_output`` images still get the original
+   remove-the-triple treatment (no placeholder there) — those are only
+   produced by ``computer-use-preview`` models which we don't currently
+   target, and the triple-removal would need a different placeholder
+   shape that we'd want to validate against the API contract first.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 
 from agent.callbacks.image_retention import ImageRetentionCallback
+
+
+PRUNED_HISTORY_IMAGE_MARKER = "[image data removed - already processed by model]"
+"""Placeholder text inserted in place of pruned image blocks.
+
+Mirrors OpenClaw's ``PRUNED_HISTORY_IMAGE_MARKER`` from
+``src/agents/pi-embedded-runner/run/history-image-prune.ts``. Short
+(~8 tokens) and byte-stable so subsequent turns can reuse it as part
+of the cached prefix without paying re-write cost.
+"""
+
+
+RetentionMode = Literal["count", "turn"]
 
 
 def _is_image_block(block: Any) -> bool:
@@ -43,13 +82,45 @@ def _is_image_block(block: Any) -> bool:
     )
 
 
+def _make_placeholder_block() -> Dict[str, Any]:
+    return {"type": "text", "text": PRUNED_HISTORY_IMAGE_MARKER}
+
+
 class OpenClawImageRetentionCallback(ImageRetentionCallback):
-    """ImageRetentionCallback that prunes both native and function-call shim screenshots."""
+    """ImageRetentionCallback that prunes both native and function-call shim screenshots.
+
+    Args:
+        only_n_most_recent_images: Retention budget. In ``mode="count"``,
+            this is the max number of images to keep. In ``mode="turn"``,
+            this is the max number of completed turns whose images are kept
+            (analogous to OpenClaw's ``PRESERVE_RECENT_COMPLETED_TURNS``).
+            Pass ``None`` to disable pruning entirely.
+        mode: ``"count"`` (default, CUA-compatible) or ``"turn"``
+            (OpenClaw-parity).
+    """
+
+    def __init__(
+        self,
+        only_n_most_recent_images: int | None = None,
+        mode: RetentionMode = "count",
+    ):
+        super().__init__(only_n_most_recent_images=only_n_most_recent_images)
+        if mode not in ("count", "turn"):
+            raise ValueError(f"mode must be 'count' or 'turn', got {mode!r}")
+        self.mode = mode
 
     def _apply_image_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.only_n_most_recent_images is None:
             return messages
+        if self.mode == "turn":
+            return self._apply_turn_retention(messages)
+        return self._apply_count_retention(messages)
 
+    # ------------------------------------------------------------------
+    # count mode (default — CUA-compatible behavior + sticky placeholder)
+    # ------------------------------------------------------------------
+
+    def _apply_count_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = self.only_n_most_recent_images
 
         # Index every image location across both paths, in message order.
@@ -73,7 +144,78 @@ class OpenClawImageRetentionCallback(ImageRetentionCallback):
             return messages
 
         drop = locs[:-n]
+        return self._apply_drops(messages, drop)
 
+    # ------------------------------------------------------------------
+    # turn mode (OpenClaw-parity — opt-in via mode="turn")
+    # ------------------------------------------------------------------
+
+    def _apply_turn_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep images from the last N completed turns; placeholder-replace older ones.
+
+        Mirrors ``pruneProcessedHistoryImages`` in OpenClaw's
+        ``history-image-prune.ts``. A "completed turn" is counted by
+        transitions into an assistant-emitting message (``role=assistant``
+        or ``type in {"reasoning", "function_call", "computer_call"}``).
+        """
+        n = self.only_n_most_recent_images
+        turn_starts = self._find_turn_starts(messages)
+        if len(turn_starts) <= n:
+            return messages
+        # Cutoff index: prune images in messages[0..cutoff). Everything
+        # at or after cutoff is in the "recent N turns" window.
+        cutoff = turn_starts[-n]
+
+        # Find image locations strictly before the cutoff.
+        locs: list[tuple[int, str, int | None]] = []
+        for idx in range(cutoff):
+            msg = messages[idx]
+            if msg.get("type") == "computer_call_output":
+                out = msg.get("output")
+                if isinstance(out, dict) and "image_url" in out:
+                    locs.append((idx, "native_output", None))
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for bidx, block in enumerate(content):
+                    if _is_image_block(block):
+                        locs.append((idx, "user_block", bidx))
+
+        if not locs:
+            return messages
+        return self._apply_drops(messages, locs)
+
+    @staticmethod
+    def _find_turn_starts(messages: List[Dict[str, Any]]) -> List[int]:
+        """Return indices where a new assistant-emitting turn begins.
+
+        A new turn begins on the transition from a non-assistant message
+        (user / tool result) to an assistant-emitting one (assistant role,
+        reasoning, function_call, computer_call). Consecutive assistant-
+        emitting messages within the same turn don't count as new turns.
+        """
+        ASSISTANT_TYPES = {"reasoning", "function_call", "computer_call"}
+        starts: List[int] = []
+        prev_was_assistant = False
+        for idx, msg in enumerate(messages):
+            role = msg.get("role")
+            msg_type = msg.get("type")
+            is_assistant = (role == "assistant") or (msg_type in ASSISTANT_TYPES)
+            if is_assistant and not prev_was_assistant:
+                starts.append(idx)
+            prev_was_assistant = is_assistant
+        return starts
+
+    # ------------------------------------------------------------------
+    # Shared drop-application — placeholder for user_block, triple-remove
+    # for native_output (preserves API contract for native path).
+    # ------------------------------------------------------------------
+
+    def _apply_drops(
+        self,
+        messages: List[Dict[str, Any]],
+        drop: List[tuple[int, str, int | None]],
+    ) -> List[Dict[str, Any]]:
         # Native: remove the computer_call_output, its producing computer_call
         # (matched by call_id), and any preceding reasoning block.
         drop_native_indices = {idx for idx, kind, _ in drop if kind == "native_output"}
@@ -92,9 +234,10 @@ class OpenClawImageRetentionCallback(ImageRetentionCallback):
                         to_remove.add(r_idx)
                     break
 
-        # Shim: strip per-block from user messages. Messages whose content is
-        # entirely image blocks (the typical post-action screenshot message)
-        # become empty after stripping → drop the message entirely.
+        # Shim: strip per-block from user messages. Messages whose content
+        # was image-only become a placeholder text block — NOT deleted.
+        # Deletion would shift every subsequent message index, busting the
+        # cache prefix from the deletion point onward (see module docstring).
         drop_blocks_by_msg: dict[int, set[int]] = {}
         for idx, kind, bidx in drop:
             if kind == "user_block":
@@ -111,7 +254,7 @@ class OpenClawImageRetentionCallback(ImageRetentionCallback):
                     if bi not in drop_blocks_by_msg[i]
                 ]
                 if not stripped:
-                    continue
+                    stripped = [_make_placeholder_block()]
                 out.append({**msg, "content": stripped})
             else:
                 out.append(msg)
