@@ -29,6 +29,11 @@ from .adapters import (
 )
 from .agent_loop import OpenClawComputerAgent
 from .analyze_image import AnalyzeImageTool
+from .cache_policy import (
+    OPENCLAW_CACHE_BOUNDARY,
+    CachePolicyCallback,
+    supports_anthropic_cache,
+)
 from .computer_handler import OpenClawComputerHandler
 from .canonical import (
     CanonicalMessage,
@@ -173,6 +178,9 @@ __all__ = [
     "DelegateGUITool",
     "SubagentsTool",
     "AnalyzeImageTool",
+    "CachePolicyCallback",
+    "OPENCLAW_CACHE_BOUNDARY",
+    "supports_anthropic_cache",
     "ReadFileTool",
     "WriteFileTool",
     "EditFileTool",

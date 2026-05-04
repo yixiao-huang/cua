@@ -67,6 +67,7 @@ from .computer_handler import OpenClawComputerHandler
 from .context import ContextOverflowCallback, compact_messages, is_context_overflow_error
 from .memory import MemoryStore
 from .memory_flush import run_memory_flush
+from .prompt import ContextFile
 from .session import (
     MEMORY_FLUSH_PROMPT,
     MEMORY_FLUSH_SYSTEM_PROMPT,
@@ -174,6 +175,7 @@ class OpenClawComputerAgent(ComputerAgent):
         summary_runtime: ResolvedModel | None = None,
         registry: SubagentRegistry | None = None,
         auto_screenshot: bool = False,
+        context_files: Optional[List[ContextFile]] = None,
         **kwargs,  # Pass through to ComputerAgent
     ):
         # Auto-inject overflow_cb into callbacks (US-OC-028)
@@ -232,6 +234,11 @@ class OpenClawComputerAgent(ComputerAgent):
         self.resolved_model = resolved_model
         self.summary_runtime = summary_runtime
         self._registry = registry
+        # Stable bootstrap files re-injected post-compaction so the agent
+        # re-anchors on workspace rules after the lossy summary. Mirrors
+        # OpenClaw's readPostCompactionContext (post-compaction-context.ts).
+        # Empty / None disables the re-injection.
+        self._context_files: List[ContextFile] = list(context_files or [])
 
     @property
     def compaction_count(self) -> int:
@@ -903,6 +910,14 @@ class OpenClawComputerAgent(ComputerAgent):
         items.extend(compacted_items)
         new_items.clear()
 
+        # Re-anchor the agent on stable workspace rules after the lossy
+        # summary, and seed a byte-stable cache prefix block. Mirrors
+        # OpenClaw's readPostCompactionContext (auto-reply/reply/post-
+        # compaction-context.ts) called from agent-runner.ts:1565.
+        post_compaction = self._build_post_compaction_message()
+        if post_compaction is not None:
+            items.append(post_compaction)
+
         # Reset and track
         self.overflow_cb.reset_after_compaction()
         self._compaction_count += 1
@@ -914,6 +929,36 @@ class OpenClawComputerAgent(ComputerAgent):
             f"[Compaction] In-place compaction #{self._compaction_count} complete "
             f"({compaction_result.tokens_before}->~{len(compacted_items)} items)"
         )
+
+    def _build_post_compaction_message(self) -> Optional[Dict[str, Any]]:
+        """Build the post-compaction context-refresh user message.
+
+        Returns ``None`` when no context files are registered (the natural
+        disable knob — analogous to OpenClaw's ``postCompactionSections: []``).
+
+        The message is framed as an explicit auto-injection so the model
+        doesn't attribute it to the user. Re-reads bootstrap files verbatim
+        so the resulting block is byte-identical across compactions and
+        across runs — caches well as a fresh prefix point.
+        """
+        if not self._context_files:
+            return None
+
+        parts: List[str] = [
+            "[Auto: post-compaction context refresh]",
+            "",
+            (
+                "The conversation above was just compacted into a summary. "
+                "Re-anchoring on stable workspace rules before continuing:"
+            ),
+            "",
+        ]
+        for cf in self._context_files:
+            parts.append(f"## {cf.path}")
+            parts.append("")
+            parts.append(cf.content.rstrip())
+            parts.append("")
+        return {"role": "user", "content": "\n".join(parts).rstrip() + "\n"}
 
     def _sanitize_runtime_messages(
         self,
