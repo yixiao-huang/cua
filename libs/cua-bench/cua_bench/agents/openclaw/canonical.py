@@ -1246,11 +1246,33 @@ def canonical_to_anthropic_messages(
                 if btype == "text":
                     content.append({"type": "text", "text": block["text"]})
                 elif btype == "function_call":
+                    raw_args = block["arguments"]
+                    if not raw_args:
+                        tool_input: dict[str, Any] = {}
+                    else:
+                        try:
+                            tool_input = json.loads(raw_args)
+                        except (json.JSONDecodeError, TypeError):
+                            # Defense-in-depth: a function_call may carry a
+                            # truncated/malformed arguments string from a
+                            # mid-stream upstream-provider drop. The write-side
+                            # sanitizer in OpenClawComputerAgent should have
+                            # already rewritten these, but any older transcript
+                            # entries (or future code paths that bypass the
+                            # sanitizer) would crash compaction's history
+                            # rebuild here. Fall back to a marked placeholder
+                            # so re-serialization stays self-consistent.
+                            partial = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
+                            tool_input = {
+                                "_truncated_by_upstream": True,
+                                "_partial_args": partial,
+                                "_original_length": len(raw_args) if isinstance(raw_args, str) else 0,
+                            }
                     content.append({
                         "type": "tool_use",
                         "id": block["id"],
                         "name": block["name"],
-                        "input": json.loads(block["arguments"]) if block["arguments"] else {},
+                        "input": tool_input,
                     })
                 elif btype == "computer_call":
                     content.append({

@@ -361,6 +361,18 @@ class OpenClawComputerAgent(ComputerAgent):
             result["output"] = await self._on_llm_end(result.get("output", []))
             await self._on_responses(loop_kwargs, result)
 
+            # Sanitize truncated tool-call payloads before anything else
+            # touches result["output"]. Mid-stream provider drops (sonnet-4.6
+            # via OpenRouter, observed on `write` calls) leave a function_call
+            # block with a half-finished JSON arguments string. If we let it
+            # through, the bad string ends up persisted in transcript and in
+            # the in-memory message list — fine for normal per-turn API sends,
+            # but compaction's history rebuild re-parses every function_call's
+            # arguments and crashes the run. Rewriting in place + appending
+            # the synthetic tool_error here keeps the data self-consistent so
+            # any downstream re-serializer is safe.
+            self._sanitize_truncated_function_calls(result.get("output", []))
+
             yield result
 
             # Log model-emitted assistant content/tool calls to transcript.
@@ -539,6 +551,77 @@ class OpenClawComputerAgent(ComputerAgent):
             upgraded = OpenClawComputerHandler(handler.cua_computer)
             await upgraded._initialize()
             self.computer_handler = upgraded
+
+    def _sanitize_truncated_function_calls(
+        self,
+        output_items: List[Dict[str, Any]],
+    ) -> None:
+        """Rewrite truncated tool-call payloads in place + emit synthetic errors.
+
+        Mid-stream upstream-provider drops (observed on sonnet-4.6 via
+        OpenRouter, almost always on `write` calls right before the large
+        ``contents`` field) leave a ``function_call`` block whose ``arguments``
+        is a half-finished JSON string. Letting it through corrupts the
+        canonical history: per-turn API sends tolerate the bad string (it's
+        forwarded as-is and never re-parsed), but compaction's history rebuild
+        in ``canonical_to_anthropic_messages`` does ``json.loads`` on every
+        function_call's arguments and crashes the entire run with an empty
+        "Agent error:" status.
+
+        Sanitize at the earliest point — right after ``predict_step`` returns,
+        before transcript logging or in-memory accumulation — so:
+          1. The persisted ``arguments`` is always valid JSON.
+          2. The synthetic ``function_call_output`` (tool_error) is paired
+             with the cleaned function_call in the same transcript group.
+          3. ``get_output_call_ids`` automatically picks up the synthetic
+             output's call_id, so ``_handle_item`` skips dispatching the
+             (now placeholder-shaped) write call. No ``ignore_call_ids``
+             plumbing needed.
+
+        The defensive try/except in ``_handle_item`` stays as a backstop in
+        case some new code path slips an unsanitized item past this point.
+        """
+        synthetic_outputs: List[Dict[str, Any]] = []
+        for item in output_items:
+            if item.get("type") != "function_call":
+                continue
+            raw_args = item.get("arguments")
+            if not isinstance(raw_args, str) or not raw_args:
+                continue
+            try:
+                json.loads(raw_args)
+                continue
+            except (json.JSONDecodeError, TypeError) as e:
+                tool_name = item.get("name", "<unknown>")
+                call_id = item.get("call_id")
+                snippet = raw_args[:200] + "..." if len(raw_args) > 200 else raw_args
+                error_message = (
+                    f"Malformed tool-call arguments for {tool_name!r} "
+                    f"(likely truncated by upstream provider): {e!r}. "
+                    f"Raw arguments: {snippet!r}. "
+                    f"Please retry the call with complete arguments."
+                )
+                # Replace the broken arguments string with a valid placeholder
+                # so any future re-serializer (compaction, replay, debug
+                # tooling) can json.loads() it without exploding. The marker
+                # keys make the recovery visible in transcripts/logs.
+                item["arguments"] = json.dumps({
+                    "_truncated_by_upstream": True,
+                    "_partial_args": raw_args[:200],
+                    "_original_length": len(raw_args),
+                    "_recovery_note": "Original arguments truncated mid-stream; "
+                                      "synthetic tool_error was returned to the model.",
+                })
+                synthetic_outputs.append(make_tool_error_item(error_message, call_id))
+                print(
+                    f"[Sanitize] Truncated tool-call args for {tool_name!r} "
+                    f"(call_id={call_id}, len={len(raw_args)}); "
+                    f"rewrote arguments + emitted synthetic tool_error"
+                )
+        # Append synthetic outputs to the same output list so they land in
+        # the same transcript group, count toward output_call_ids, and reach
+        # the model on the next turn as paired tool_results.
+        output_items.extend(synthetic_outputs)
 
     async def _handle_item(
         self,
