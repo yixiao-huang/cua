@@ -301,11 +301,9 @@ class PromptBuilder:
             lines.append(
                 "Writing: use write with target='host' to journal memory. "
                 "Append raw observations, actions, and errors to "
-                "memory/session-NNN.md during the run (host writes default "
-                "to append=True). Overwrite TASK_MEMORY.md (append=False) "
-                "with distilled strategies and patterns worth keeping across "
-                "sessions — overwriting replaces the whole file, so always "
-                "include everything worth keeping."
+                "memory/session-NNN.md during the run. Update "
+                "TASK_MEMORY.md with distilled strategies and patterns "
+                "worth keeping across sessions."
             )
 
         lines.append("")

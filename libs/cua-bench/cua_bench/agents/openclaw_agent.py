@@ -251,17 +251,16 @@ class OpenClawAgent(BaseAgent):
             workspace_root = None
 
         # Host workspace root for `target='host'` on read/write/edit. Operator
-        # override via OPENCLAW_HOST_WORKSPACE; otherwise auto-detect the repo
-        # root by walking up to the first ancestor containing a `.git` dir.
-        # When unresolved, the host backend isn't registered and the agent
-        # only sees `target='vm'` in the schema enum.
-        from .openclaw.fs_backends import detect_host_workspace_root
+        # override via OPENCLAW_HOST_WORKSPACE; otherwise pin per-task to the
+        # MemoryStore task dir so the agent's relative writes
+        # (memory/session-NNN.md, TASK_MEMORY.md) round-trip into the host
+        # memory store rather than landing at the repo root or the VM's
+        # cua-server cwd.
         host_override = os.environ.get("OPENCLAW_HOST_WORKSPACE", "").strip()
         if host_override:
             host_workspace_root: str | None = str(Path(host_override).resolve())
         else:
-            detected = detect_host_workspace_root()
-            host_workspace_root = str(detected) if detected is not None else None
+            host_workspace_root = str(memory_store.task_dir.resolve())
 
         # Tool assembly (US-OC-007 + US-SUB-005 delegation tools + US-OC-055 fs tools)
         thinking_api_params = self.thinking_config.to_api_params(self.model)
