@@ -176,11 +176,14 @@ class OpenClawComputerAgent(ComputerAgent):
         registry: SubagentRegistry | None = None,
         auto_screenshot: bool = False,
         context_files: Optional[List[ContextFile]] = None,
-        # Image retention mode (US-OC-072): "count" preserves the CUA-default
-        # last-N-images budget; "turn" switches to OpenClaw-parity last-N-
-        # completed-turns. Both modes use sticky placeholder replacement
-        # (no message-deletion cache thrash).
-        image_retention_mode: str = "count",
+        # Image retention mode (US-OC-072): "openclaw" (default) keeps all
+        # images from the last N completed turns (OpenClaw-parity); "cua"
+        # keeps the last N images by count (CUA-default). Both modes use
+        # sticky placeholder replacement (no message-deletion cache thrash).
+        # Default flipped from "count" to "openclaw" after on-task verification
+        # — see develop-doc/cache-thrash-image-retention.md in the agenthle
+        # repo.
+        image_retention_mode: str = "openclaw",
         **kwargs,  # Pass through to ComputerAgent
     ):
         # Auto-inject overflow_cb into callbacks (US-OC-028)

@@ -21,7 +21,7 @@ Three extensions on top of the SDK's ``ImageRetentionCallback``:
    strips older image blocks, and replaces them with a stable text
    placeholder when the message is image-only.
 
-3. **Sticky placeholder + optional turn-based mode** (US-OC-072).
+3. **Sticky placeholder + selectable threshold mode** (US-OC-072).
    When the SDK's per-block strip empties a user message, the original
    behavior dropped the message entirely. That deletion shifts every
    subsequent message index, busting Anthropic's prefix cache from the
@@ -35,18 +35,20 @@ Three extensions on top of the SDK's ``ImageRetentionCallback``:
      becomes part of the cached prefix on subsequent turns. Cache prefix
      extension recovers from "pinned at system prompt" to monotonic.
 
-   - **Mode = "count" (default)**: original CUA behavior — keep the last
-     ``only_n_most_recent_images`` images. Each new image past the
-     budget ages out the oldest one.
-
-   - **Mode = "turn" (opt-in)**: OpenClaw-style — keep all images from
-     the last ``only_n_most_recent_images`` *completed turns*. A turn
-     boundary is a transition into an assistant/tool-emitting message.
-     Mirrors ``pruneProcessedHistoryImages`` in
+   - **Mode = "openclaw" (default)**: OpenClaw-parity — keep all images
+     from the last ``only_n_most_recent_images`` *completed turns*. A
+     turn boundary is a transition into an assistant/tool-emitting
+     message. Mirrors ``pruneProcessedHistoryImages`` in
      ``openclaw/src/agents/pi-embedded-runner/run/history-image-prune.ts``.
-     Better for multi-screenshot turns (keeps the cluster intact);
-     drops older images sooner if turns interleave with no-screenshot
-     turns.
+     Multi-screenshot turns stay intact; on-task verification showed
+     ~89% cache hit rate vs ~55% for "cua" on hardware/Analog_Active.
+
+   - **Mode = "cua" (opt-in)**: CUA-default behavior — keep the last
+     ``only_n_most_recent_images`` images by count. Each new image past
+     the budget ages out the oldest one. With sticky-placeholder this
+     no longer pins the cache to the system prompt, but the per-turn
+     image-aging still triggers one cache invalidation per displaced
+     image (vs. one-per-turn-boundary in openclaw mode).
 
    Native ``computer_call_output`` images still get the original
    remove-the-triple treatment (no placeholder there) — those are only
@@ -72,7 +74,17 @@ of the cached prefix without paying re-write cost.
 """
 
 
-RetentionMode = Literal["count", "turn"]
+RetentionMode = Literal["cua", "openclaw"]
+"""Mode names track the source benchmark whose retention policy each one
+mirrors:
+    "cua"      — CUA-default last-N-images-by-count threshold.
+    "openclaw" — OpenClaw-parity last-N-completed-turns threshold
+                 (mirrors ``pruneProcessedHistoryImages``).
+
+Both modes share the sticky-placeholder fix from US-OC-072. The OpenClaw
+threshold became the default after on-task verification (see
+``develop-doc/cache-thrash-image-retention.md`` in the agenthle repo).
+"""
 
 
 def _is_image_block(block: Any) -> bool:
@@ -90,37 +102,39 @@ class OpenClawImageRetentionCallback(ImageRetentionCallback):
     """ImageRetentionCallback that prunes both native and function-call shim screenshots.
 
     Args:
-        only_n_most_recent_images: Retention budget. In ``mode="count"``,
-            this is the max number of images to keep. In ``mode="turn"``,
+        only_n_most_recent_images: Retention budget. In ``mode="cua"``,
+            this is the max number of images to keep. In ``mode="openclaw"``,
             this is the max number of completed turns whose images are kept
             (analogous to OpenClaw's ``PRESERVE_RECENT_COMPLETED_TURNS``).
             Pass ``None`` to disable pruning entirely.
-        mode: ``"count"`` (default, CUA-compatible) or ``"turn"``
-            (OpenClaw-parity).
+        mode: ``"openclaw"`` (default, OpenClaw-parity) or ``"cua"``
+            (CUA-compatible). Default flipped from ``"cua"`` to ``"openclaw"``
+            after US-OC-072 verification — see
+            ``develop-doc/cache-thrash-image-retention.md``.
     """
 
     def __init__(
         self,
         only_n_most_recent_images: int | None = None,
-        mode: RetentionMode = "count",
+        mode: RetentionMode = "openclaw",
     ):
         super().__init__(only_n_most_recent_images=only_n_most_recent_images)
-        if mode not in ("count", "turn"):
-            raise ValueError(f"mode must be 'count' or 'turn', got {mode!r}")
+        if mode not in ("cua", "openclaw"):
+            raise ValueError(f"mode must be 'cua' or 'openclaw', got {mode!r}")
         self.mode = mode
 
     def _apply_image_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.only_n_most_recent_images is None:
             return messages
-        if self.mode == "turn":
-            return self._apply_turn_retention(messages)
-        return self._apply_count_retention(messages)
+        if self.mode == "openclaw":
+            return self._apply_openclaw_retention(messages)
+        return self._apply_cua_retention(messages)
 
     # ------------------------------------------------------------------
-    # count mode (default — CUA-compatible behavior + sticky placeholder)
+    # cua mode (CUA-compatible behavior + sticky placeholder)
     # ------------------------------------------------------------------
 
-    def _apply_count_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _apply_cua_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = self.only_n_most_recent_images
 
         # Index every image location across both paths, in message order.
@@ -147,10 +161,10 @@ class OpenClawImageRetentionCallback(ImageRetentionCallback):
         return self._apply_drops(messages, drop)
 
     # ------------------------------------------------------------------
-    # turn mode (OpenClaw-parity — opt-in via mode="turn")
+    # openclaw mode (OpenClaw-parity — default since US-OC-072 verification)
     # ------------------------------------------------------------------
 
-    def _apply_turn_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _apply_openclaw_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Keep images from the last N completed turns; placeholder-replace older ones.
 
         Mirrors ``pruneProcessedHistoryImages`` in OpenClaw's
