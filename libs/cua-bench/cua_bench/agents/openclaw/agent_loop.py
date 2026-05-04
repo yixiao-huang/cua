@@ -466,17 +466,23 @@ class OpenClawComputerAgent(ComputerAgent):
         await self._on_run_end(loop_kwargs, items, new_items)
 
     async def _maybe_flush_memory(self) -> None:
-        """Run memory flush if token threshold is exceeded.
+        """Run memory flush if token or transcript-size threshold is exceeded.
 
         Single call site for memory flush — called pre-API in run().
-        Matches OpenClaw's runMemoryFlushIfNeeded pattern.
+        Matches OpenClaw's runMemoryFlushIfNeeded pattern, including the
+        transcript-size force trigger from buildMemoryFlushPlan().
         """
         if self.session_mgr._state is None:
             return
+        try:
+            transcript_bytes = self.session_mgr.transcript_path.stat().st_size
+        except OSError:
+            transcript_bytes = 0
         if not should_run_memory_flush(
             self.session_mgr._state,
             current_tokens=self.overflow_cb.current_tokens,
             context_window=self.overflow_cb.context_window,
+            transcript_bytes=transcript_bytes,
             compaction_ratio=self.overflow_cb.compaction_threshold_ratio,
         ):
             return

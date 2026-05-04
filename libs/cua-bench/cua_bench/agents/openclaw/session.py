@@ -515,6 +515,9 @@ MEMORY_FLUSH_SYSTEM_PROMPT = (
 
 DEFAULT_MEMORY_FLUSH_SOFT_THRESHOLD_TOKENS = 4000
 DEFAULT_MEMORY_FLUSH_RESERVE_TOKENS_FLOOR = 20_000
+# Mirrors OpenClaw's DEFAULT_MEMORY_FLUSH_FORCE_TRANSCRIPT_BYTES
+# (extensions/memory-core/src/flush-plan.ts:11). Set to 0 to disable.
+DEFAULT_MEMORY_FLUSH_FORCE_TRANSCRIPT_BYTES = 2 * 1024 * 1024  # 2 MB
 
 
 DEFAULT_COMPACTION_RATIO = 0.80
@@ -525,39 +528,48 @@ def should_run_memory_flush(
     *,
     current_tokens: int,
     context_window: int,
+    transcript_bytes: int = 0,
     compaction_ratio: float = DEFAULT_COMPACTION_RATIO,
     soft_threshold_tokens: int = DEFAULT_MEMORY_FLUSH_SOFT_THRESHOLD_TOKENS,
     reserve_tokens: int = DEFAULT_MEMORY_FLUSH_RESERVE_TOKENS_FLOOR,
+    force_transcript_bytes: int = DEFAULT_MEMORY_FLUSH_FORCE_TRANSCRIPT_BYTES,
 ) -> bool:
     """Determine whether a pre-compaction memory flush should run.
 
-    The flush must fire BEFORE compaction. agenthle's compaction is proactive
-    at ``compaction_ratio * context_window`` (default 80%), so the flush
-    threshold is anchored to the compaction trigger — not the raw context
-    window — with ``reserve + soft_threshold`` of headroom below it. With the
-    defaults that's a 24K-token cushion, large enough for the flush turn's own
-    completion plus a step or two of slack.
+    Two independent triggers (matching OpenClaw):
 
-    For a 200K window @ 0.80: compaction at 160K, flush at 136K (24K cushion).
-    For a 1M window  @ 0.80: compaction at 800K, flush at 776K (24K cushion).
+    1. Token-count: flush when ``current_tokens`` reaches the threshold below
+       the compaction trigger. agenthle's compaction is proactive at
+       ``compaction_ratio * context_window`` (default 80%), so the threshold is
+       anchored to that trigger — not the raw context window — with
+       ``reserve + soft_threshold`` of headroom below it. For a 200K window
+       @ 0.80 this is 136K (24K cushion); for 1M @ 0.80 it is 776K.
+       Pass ``compaction_ratio=1.0`` to recover OpenClaw's window-edge
+       semantics (correct only when compaction also fires at the literal limit).
 
-    Pass ``compaction_ratio=1.0`` to recover OpenClaw's original semantics
-    (flush anchored to the absolute context window edge), which is correct
-    only when compaction also fires at the literal limit.
+    2. Transcript-size: flush when the on-disk transcript file reaches
+       ``force_transcript_bytes`` (default 2 MB). Mirrors OpenClaw's
+       ``forceFlushTranscriptBytes`` — useful when token estimation drifts
+       but the transcript still grows. Pass 0 to disable.
+
+    Either trigger fires independently. The "already flushed in this
+    compaction cycle" dedup guard applies to both.
 
     Based on OpenClaw's shouldRunMemoryFlush()
-    (openclaw/src/auto-reply/reply/memory-flush.ts:124-169), adapted because
-    agenthle compacts at a ratio rather than at the absolute edge.
+    (openclaw/src/auto-reply/reply/memory-flush.ts:124-169) and
+    buildMemoryFlushPlan() (extensions/memory-core/src/flush-plan.ts:95-140).
     """
-    if current_tokens <= 0:
-        return False
-    if compaction_ratio <= 0 or compaction_ratio > 1:
-        return False
-    compaction_trigger = int(context_window * compaction_ratio)
-    threshold = max(0, compaction_trigger - reserve_tokens - soft_threshold_tokens)
-    if threshold <= 0:
-        return False
-    if current_tokens < threshold:
+    by_tokens = False
+    if current_tokens > 0 and 0 < compaction_ratio <= 1:
+        compaction_trigger = int(context_window * compaction_ratio)
+        threshold = max(0, compaction_trigger - reserve_tokens - soft_threshold_tokens)
+        by_tokens = threshold > 0 and current_tokens >= threshold
+
+    by_transcript = (
+        force_transcript_bytes > 0 and transcript_bytes >= force_transcript_bytes
+    )
+
+    if not (by_tokens or by_transcript):
         return False
     return not has_already_flushed_for_current_compaction(state)
 
