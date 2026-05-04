@@ -419,11 +419,28 @@ class OpenClawComputerAgent(ComputerAgent):
             if has_done_signal(result.get("output", [])):
                 break
 
-            # TODO(bug-2-nudge): when the turn produced neither a tool call
-            # nor a DONE, inject a continuation nudge as a user message so
-            # the next predict_step has a user turn to respond to. Without
-            # one, bare-text turns leave new_items ending on an assistant
-            # message, which some APIs reject. Pick wording before enabling.
+            # === BARE-TEXT TURN NUDGE (bug-2-nudge) ===
+            # When a turn produces neither a tool call nor a DONE marker,
+            # inject a user-role continuation message so the next predict_step
+            # has a user turn at the tail. Without it, bare-text assistant
+            # turns leave the conversation ending on assistant, which some
+            # providers reject — notably Anthropic-via-Vertex routed through
+            # OpenRouter ("This model does not support assistant message
+            # prefill"). Anthropic-direct and Bedrock tolerate assistant-tail,
+            # so the bug only surfaces under that specific routing.
+            output_items = result.get("output", [])
+            has_tool_call = any(
+                item.get("type") in ("function_call", "computer_call")
+                for item in output_items
+            )
+            if not has_tool_call:
+                nudge_text = (
+                    "Please continue: emit your next tool call to make "
+                    "progress, or output the DONE marker if the task is "
+                    "complete."
+                )
+                new_items.append({"role": "user", "content": nudge_text})
+                self.session_mgr.append_message("user", nudge_text)
 
         await self._on_run_end(loop_kwargs, items, new_items)
 
