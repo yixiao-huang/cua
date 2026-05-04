@@ -29,6 +29,8 @@ from agent.decorators import register_agent
 from agent.loops.base import AsyncAgentConfig
 from agent.types import AgentCapability, Messages, Tools
 
+from .cache_policy import apply_openclaw_cache_markers
+
 
 # ---------------------------------------------------------------------------
 # Tool preparation
@@ -507,6 +509,16 @@ class UnifiedAgentConfig(AsyncAgentConfig):
 
         # Convert Responses API input → Chat Completions messages
         chat_messages = _convert_input_to_messages(messages)
+
+        # Apply OpenClaw cache_control markers in-place. Must happen here
+        # (not via a callback) because ``agent.py:_on_api_start`` passes
+        # ``get_json(kwargs)`` — a deep copy — to callbacks, so a hook's
+        # mutation never reaches the actual API call. For Anthropic-family
+        # models the helper marks the system prompt + trailing message as
+        # ephemeral; for OpenAI/other providers it strips markers and is a
+        # no-op (those providers cache automatically server-side).
+        if use_prompt_caching:
+            apply_openclaw_cache_markers(chat_messages, model)
 
         # Build API kwargs
         api_kwargs: Dict[str, Any] = {

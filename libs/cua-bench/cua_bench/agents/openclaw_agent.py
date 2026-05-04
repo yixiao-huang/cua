@@ -172,7 +172,6 @@ class OpenClawAgent(BaseAgent):
 
         # Build structured system prompt via PromptBuilder (US-OC-001)
         from .openclaw import (
-            CachePolicyCallback,
             ContextFile,
             ContextOverflowCallback,
             MemoryStore,
@@ -336,11 +335,9 @@ class OpenClawAgent(BaseAgent):
         # overflow_cb is auto-injected into callbacks by OpenClawComputerAgent (US-OC-028)
         # Thinking params flow to ComputerAgent's additional_generation_kwargs (US-OC-019)
         tool_logging_cb = ToolLoggingCallback()
-        # Prompt-cache policy: re-applies cache_control on system prompt + trailing
-        # turn (sliding breakpoint). use_prompt_caching=True triggers CUA's
-        # _combine_completion_messages; CachePolicyCallback then strips CUA's
-        # broken first-4 markers and re-applies them per OpenClaw semantics.
-        cache_policy_cb = CachePolicyCallback()
+        # use_prompt_caching=True trips the gate in
+        # ``UnifiedAgentConfig.predict_step`` that calls
+        # ``apply_openclaw_cache_markers`` on Anthropic-family models.
         agent = OpenClawComputerAgent(
             # ComputerAgent params
             model=self.model,
@@ -349,7 +346,7 @@ class OpenClawAgent(BaseAgent):
             trajectory_dir=trajectory_dir,
             instructions=instructions,
             use_prompt_caching=True,
-            callbacks=[tool_logging_cb, cache_policy_cb],
+            callbacks=[tool_logging_cb],
             # Re-injected as a user message after each compaction (US-OC-070
             # post-compaction context refresh — mirrors OpenClaw default).
             context_files=context_files,

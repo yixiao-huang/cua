@@ -28,8 +28,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from agent.callbacks.base import AsyncCallbackHandler
-
 
 OPENCLAW_CACHE_BOUNDARY = "<!-- OPENCLAW_CACHE_BOUNDARY -->"
 """Marker inserted by PromptBuilder between stable and dynamic prompt sections.
@@ -68,42 +66,49 @@ def supports_anthropic_cache(model: str | None) -> bool:
     return False
 
 
-class CachePolicyCallback(AsyncCallbackHandler):
-    """Re-applies cache_control markers using OpenClaw's sliding-breakpoint pattern.
+def apply_openclaw_cache_markers(
+    messages: List[Dict[str, Any]] | None,
+    model: str | None,
+) -> None:
+    """Apply OpenClaw's sliding-breakpoint cache_control pattern in-place.
 
-    Hooks ``on_api_start`` so it runs after CUA's ``_add_cache_control`` (which
-    we still need enabled for its message-combining side-effect). Order of
-    operations per turn:
+    Mutates ``messages``:
+      1. Strip any pre-existing message-level markers (e.g. CUA's broken
+         first-4 marking from ``anthropic.py:_add_cache_control``).
+      2. If ``model`` isn't Anthropic-family, also strip block-level markers
+         and return (no caching available).
+      3. Otherwise mark the system prompt (splitting at
+         ``OPENCLAW_CACHE_BOUNDARY`` if present) and the trailing
+         user/tool_result message — sliding breakpoint so the cached prefix
+         grows turn by turn.
 
-      1. Strip CUA's broken first-4 message-level markers.
-      2. If the model isn't Anthropic-family, return (markers stripped, none added).
-      3. Otherwise mark the system prompt (with boundary split if present) and
-         the trailing user/tool_result message.
+    Call this from inside the loop's ``predict_step``, before building
+    ``api_kwargs``. A callback-hook path won't work — ``agent.py``'s
+    ``_on_api_start`` deep-copies via ``get_json`` before invoking
+    callbacks, so any mutation made in a hook never reaches the actual
+    ``litellm.acompletion`` call.
     """
+    if not messages:
+        return
 
-    async def on_api_start(self, kwargs: Dict[str, Any]) -> None:
-        messages: List[Dict[str, Any]] | None = kwargs.get("messages")
-        if not messages:
-            return
+    # Always strip pre-existing message-level markers so we have a clean slate.
+    for msg in messages:
+        msg.pop("cache_control", None)
 
-        # Always strip CUA's first-4 markers so we have a clean slate.
+    if not supports_anthropic_cache(model or ""):
+        # Non-Anthropic provider — also strip any block-level markers
+        # in case the system prompt was already split before this turn.
         for msg in messages:
-            msg.pop("cache_control", None)
+            _strip_block_cache_control(msg)
+        return
 
-        if not supports_anthropic_cache(kwargs.get("model", "")):
-            # Non-Anthropic provider — also strip any block-level markers
-            # in case the system prompt was already split before this turn.
-            for msg in messages:
-                _strip_block_cache_control(msg)
-            return
+    _apply_system_cache(messages[0])
 
-        _apply_system_cache(messages[0])
-
-        # Trailing breakpoint — slides forward each turn so the cached prefix
-        # extends to include the previous turn's tool result.
-        last = messages[-1]
-        if last is not messages[0]:
-            last["cache_control"] = dict(_EPHEMERAL)
+    # Trailing breakpoint — slides forward each turn so the cached prefix
+    # extends to include the previous turn's tool result.
+    last = messages[-1]
+    if last is not messages[0]:
+        last["cache_control"] = dict(_EPHEMERAL)
 
 
 def _apply_system_cache(msg: Dict[str, Any]) -> None:

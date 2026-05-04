@@ -31,7 +31,7 @@ from .agent_loop import OpenClawComputerAgent
 from .analyze_image import AnalyzeImageTool
 from .cache_policy import (
     OPENCLAW_CACHE_BOUNDARY,
-    CachePolicyCallback,
+    apply_openclaw_cache_markers,
     supports_anthropic_cache,
 )
 from .computer_handler import OpenClawComputerHandler
@@ -178,8 +178,8 @@ __all__ = [
     "DelegateGUITool",
     "SubagentsTool",
     "AnalyzeImageTool",
-    "CachePolicyCallback",
     "OPENCLAW_CACHE_BOUNDARY",
+    "apply_openclaw_cache_markers",
     "supports_anthropic_cache",
     "ReadFileTool",
     "WriteFileTool",
