@@ -54,8 +54,14 @@ FIXED_IMAGE_TOKENS = 1200
 MAX_TOOL_RESULT_SHARE = 0.25
 """Maximum share of context window a single tool result may occupy (PRD: 25%)."""
 
-HARD_MAX_TOOL_RESULT_CHARS = 400_000
-"""Absolute character cap for a single tool result (OpenClaw safety net)."""
+HARD_MAX_TOOL_RESULT_CHARS = 16_000
+"""Absolute character cap for a single tool result.
+
+Mirrors OpenClaw's DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS (tool-result-truncation.ts:28).
+Was 400_000 before US-OC-context-fix-1 — that allowed a single tool output to consume
+~50% of a 200K window, which inflated context usage relative to OpenClaw and
+triggered compaction on noisy turns.
+"""
 
 MIN_KEEP_CHARS = 2_000
 """Minimum characters to preserve when truncating."""
@@ -287,6 +293,10 @@ class ContextOverflowCallback(AsyncCallbackHandler):
         self._turn_count = 0
         self._needs_compaction = False
         self._tag = tag
+        # API-reported actual prompt size from the most recent turn. Source-of-
+        # truth for context pressure when set; the chars/4 estimator can drift
+        # 10-20%. Mirrors OpenClaw's lastPromptTokens (pi-embedded-runner/run.ts).
+        self._last_api_prompt_tokens = 0
 
     # -- Public read-only properties --
 
@@ -317,6 +327,15 @@ class ContextOverflowCallback(AsyncCallbackHandler):
         """Number of on_llm_start calls so far."""
         return self._turn_count
 
+    @property
+    def last_api_prompt_tokens(self) -> int:
+        """Actual prompt size reported by the most recent API response.
+
+        Zero when no API call has completed since the last reset_after_compaction
+        (e.g., before the first turn or immediately after compaction).
+        """
+        return self._last_api_prompt_tokens
+
     # -- Mutation --
 
     def force_compaction(self) -> None:
@@ -328,26 +347,67 @@ class ContextOverflowCallback(AsyncCallbackHandler):
     async def on_llm_start(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Estimate tokens, truncate oversized tool results, set needs_compaction flag."""
+        """Estimate tokens, truncate oversized tool results, set needs_compaction flag.
+
+        When the previous turn's API-reported prompt size is known, use it as a
+        floor on the estimate — the next turn's prompt is at least as big as
+        the last one (we only add messages between turns). This catches cases
+        where chars/4 estimation underreports relative to the real tokenizer.
+        """
         self._turn_count += 1
         messages = truncate_tool_results(messages, self._context_window)
         raw = estimate_messages_tokens(messages)
-        self._current_tokens = int(raw * SAFETY_MARGIN) + self._instructions_tokens
+        estimated = int(raw * SAFETY_MARGIN) + self._instructions_tokens
+        self._current_tokens = max(estimated, self._last_api_prompt_tokens)
         self._needs_compaction = (
             self._current_tokens > self._context_window * self._threshold
         )
         prefix = f"[ContextOverflow:{self._tag}]" if self._tag else "[ContextOverflow]"
+        source = "api+est" if self._last_api_prompt_tokens else "est"
         print(
             f"{prefix} turn {self._turn_count}: "
             f"~{self._current_tokens // 1000}K/{self._context_window // 1000}K tokens "
-            f"({self.overflow_ratio:.0%}), needs_compaction={self._needs_compaction}"
+            f"({self.overflow_ratio:.0%}, source={source}), "
+            f"needs_compaction={self._needs_compaction}"
         )
         return messages
+
+    async def on_usage(self, usage: dict[str, Any]) -> None:
+        """Capture API-reported prompt size to refine the next turn's trigger.
+
+        After litellm's chat-completion-to-responses transform, ``input_tokens``
+        is the total prompt size including any cached portions (Anthropic
+        cache_read + cache_creation roll up into prompt_tokens upstream).
+        Falls back to ``prompt_tokens`` for older/native shapes.
+
+        If the actual prompt already exceeds the threshold, force compaction
+        so the next iteration's check fires without waiting for an overflow
+        error from the API.
+        """
+        actual = (
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or 0
+        )
+        if not isinstance(actual, (int, float)) or actual <= 0:
+            return
+        self._last_api_prompt_tokens = int(actual)
+        if actual > self._context_window * self._threshold:
+            self._needs_compaction = True
+            prefix = f"[ContextOverflow:{self._tag}]" if self._tag else "[ContextOverflow]"
+            print(
+                f"{prefix} API actual prompt="
+                f"{int(actual) // 1000}K/{self._context_window // 1000}K "
+                f"({actual / max(1, self._context_window):.0%}) — forcing compaction"
+            )
 
     def reset_after_compaction(self) -> None:
         """Reset state after a compaction cycle so the next on_llm_start re-evaluates."""
         self._needs_compaction = False
         self._current_tokens = 0
+        # Drop the stale lastPromptTokens — it reflects the pre-compaction
+        # prompt and would mask the post-compaction shrink on the next turn.
+        self._last_api_prompt_tokens = 0
 
 
 # ===========================================================================

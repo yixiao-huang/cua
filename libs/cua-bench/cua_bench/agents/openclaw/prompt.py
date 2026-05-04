@@ -27,6 +27,45 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
+BOOTSTRAP_MAX_CHARS = 12_000
+"""Per-file cap for context-file injection.
+
+Mirrors OpenClaw's DEFAULT_BOOTSTRAP_MAX_CHARS (pi-embedded-helpers/bootstrap.ts:86).
+"""
+
+BOOTSTRAP_TOTAL_MAX_CHARS = 60_000
+"""Total cap across all injected context files.
+
+Mirrors OpenClaw's DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS (pi-embedded-helpers/bootstrap.ts:87).
+"""
+
+_BOOTSTRAP_HEAD_RATIO = 0.7
+_BOOTSTRAP_TAIL_RATIO = 0.2
+
+
+def _trim_bootstrap_content(content: str, file_name: str, max_chars: int) -> str:
+    """Trim a context file to ``max_chars`` using head/tail split with marker.
+
+    Mirrors OpenClaw's trimBootstrapContent (pi-embedded-helpers/bootstrap.ts:126).
+    """
+    trimmed = content.rstrip()
+    if max_chars <= 0:
+        return ""
+    if len(trimmed) <= max_chars:
+        return trimmed
+
+    head_chars = int(max_chars * _BOOTSTRAP_HEAD_RATIO)
+    tail_chars = int(max_chars * _BOOTSTRAP_TAIL_RATIO)
+    head = trimmed[:head_chars]
+    tail = trimmed[-tail_chars:] if tail_chars > 0 else ""
+    marker = (
+        f"\n[...truncated, read {file_name} for full content...]\n"
+        f"...(truncated {file_name}: kept {head_chars}+{tail_chars} chars "
+        f"of {len(trimmed)})...\n"
+    )
+    return head + marker + tail
+
+
 @dataclass
 class ContextFile:
     """A file to inject into the Project Context section.
@@ -218,12 +257,13 @@ class PromptBuilder:
         Mirrors OpenClaw's memory-core/src/prompt-section.ts::buildPromptSection:
         each tool contributes its own behavioral line, gated on that tool being
         registered (absence-is-the-signal). Read guidance branches on the
-        search/get subset; memory_write adds its own target= guidance so the
-        operational rules live here rather than in AGENTS.md.
+        search/get subset; the unified `write` tool carries its own
+        target='host' guidance so journaling rules live here rather than in
+        AGENTS.md.
         """
         has_search = "memory_search" in tool_summaries
         has_get = "memory_get" in tool_summaries
-        has_write = "memory_write" in tool_summaries
+        has_write = "write" in tool_summaries
         if not (has_search or has_get or has_write):
             return []
 
@@ -259,12 +299,13 @@ class PromptBuilder:
 
         if has_write:
             lines.append(
-                "Writing: use memory_write with target='session' for raw "
-                "observations, actions, and errors during the run; use "
-                "target='task_memory' to overwrite TASK_MEMORY.md with distilled "
-                "strategies and patterns worth keeping across sessions. "
-                "target='task_memory' replaces the whole file — always include "
-                "everything worth keeping."
+                "Writing: use write with target='host' to journal memory. "
+                "Append raw observations, actions, and errors to "
+                "memory/session-NNN.md during the run (host writes default "
+                "to append=True). Overwrite TASK_MEMORY.md (append=False) "
+                "with distilled strategies and patterns worth keeping across "
+                "sessions — overwriting replaces the whole file, so always "
+                "include everything worth keeping."
             )
 
         lines.append("")
@@ -393,8 +434,13 @@ class PromptBuilder:
     def _build_project_context(self, context_files: list[ContextFile]) -> list[str]:
         """Build the Project Context section with injected file contents.
 
-        # TODO US-OC-008: add per-file and total char size caps
-        # (ref: openclaw bootstrap 20K/150K limits)
+        Per-file and total char caps mirror OpenClaw's bootstrap budget
+        (pi-embedded-helpers/bootstrap.ts:86-87).  Without these the system
+        prompt grows linearly with TASK_MEMORY.md / AGENTS.md and re-inflates
+        every turn, which was a primary driver of context bloat.
+
+        Truncation strategy follows OpenClaw's head-70%/tail-20% split with an
+        inline marker so the model knows content was elided.
         """
         if not context_files:
             return []
@@ -405,10 +451,16 @@ class PromptBuilder:
             "The following project context files have been loaded:",
             "",
         ]
+        remaining = BOOTSTRAP_TOTAL_MAX_CHARS
         for cf in context_files:
+            per_file_budget = min(BOOTSTRAP_MAX_CHARS, remaining)
+            content = _trim_bootstrap_content(cf.content, cf.path, per_file_budget)
             lines.append(f"### {cf.path}")
             lines.append("```")
-            lines.append(cf.content)
+            lines.append(content)
             lines.append("```")
             lines.append("")
+            remaining -= len(content)
+            if remaining <= 0:
+                break
         return lines
