@@ -41,6 +41,11 @@ from typing import Any, Optional, Union
 from agent.tools.base import BaseTool, register_tool
 
 from .fs_backends import FilesystemBackend, FilesystemRegistry
+from .image_sanitization import (
+    DEFAULT_LIMITS as _IMAGE_DEFAULT_LIMITS,
+    sanitize_raw_image_bytes,
+    sniff_mime_from_bytes as _sniff_mime_from_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +79,6 @@ def _check_capability(backend: FilesystemBackend, op: str) -> Optional[str]:
 # Constants (match OpenClaw pi-tools.read.ts:45-49 / pi-tools.host-edit.ts:22-23)
 # ---------------------------------------------------------------------------
 
-_MAX_IMAGE_BYTES_DEFAULT = 10 * 1024 * 1024            # matches DEFAULT_MAX_BYTES_MB
 _MAX_MISMATCH_HINT_CHARS = 800                         # matches EDIT_MISMATCH_HINT_LIMIT
 _DEFAULT_READ_PAGE_MAX_BYTES = 32 * 1024               # matches DEFAULT_READ_PAGE_MAX_BYTES
 _MAX_ADAPTIVE_READ_MAX_BYTES = 128 * 1024              # matches MAX_ADAPTIVE_READ_MAX_BYTES
@@ -151,29 +155,6 @@ def _mime_from_extension(path: str) -> Optional[str]:
     for ext, mime in _MIME_MAP.items():
         if lower.endswith(ext):
             return mime
-    return None
-
-
-def _sniff_mime_from_bytes(data: bytes) -> Optional[str]:
-    """Return a MIME type sniffed from magic bytes, or ``None`` if unknown.
-
-    Mirrors the subset of ``sniffMimeFromBase64`` needed for our allowed
-    extensions plus PDF (for the non-image-sniff error path).
-    """
-    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if len(data) >= 6 and data[:6] in (b"GIF87a", b"GIF89a"):
-        return "image/gif"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    if len(data) >= 2 and data[:2] == b"BM":
-        return "image/bmp"
-    if len(data) >= 4 and data[:4] in (b"II*\x00", b"MM\x00*"):
-        return "image/tiff"
-    if len(data) >= 5 and data[:5] == b"%PDF-":
-        return "application/pdf"
     return None
 
 
@@ -340,24 +321,17 @@ class ReadFileTool(BaseTool):
         declared_mime: str,
     ) -> dict:
         max_bytes_raw = params.get("max_bytes")
+        # Per-call override flows into ImageLimits; otherwise OpenClaw defaults
+        # (5 MB / 1200 px / 25 MP) live in image_sanitization.py.
         if isinstance(max_bytes_raw, (int, float)) and max_bytes_raw > 0:
-            max_bytes = int(max_bytes_raw)
+            from .image_sanitization import ImageLimits
+            limits = ImageLimits(max_bytes=int(max_bytes_raw))
         else:
-            max_bytes = _MAX_IMAGE_BYTES_DEFAULT
+            limits = _IMAGE_DEFAULT_LIMITS
 
         data = await backend.read_bytes(path)
         if not data:
             return {"success": False, "error": f"Error: file is empty: {path}"}
-        if len(data) > max_bytes:
-            actual_mb = len(data) / (1024 * 1024)
-            limit_mb = max_bytes / (1024 * 1024)
-            return {
-                "success": False,
-                "error": (
-                    f"Error: image too large ({actual_mb:.1f} MB), "
-                    f"maximum is {limit_mb:.0f} MB: {path}"
-                ),
-            }
 
         sniffed = _sniff_mime_from_bytes(data)
         effective_mime = declared_mime
@@ -372,13 +346,20 @@ class ReadFileTool(BaseTool):
                 }
             effective_mime = sniffed
 
-        b64 = base64.b64encode(data).decode("utf-8")
+        sanitized = sanitize_raw_image_bytes(
+            data, effective_mime, label=f"read:{path}", limits=limits
+        )
+        if isinstance(sanitized, str):
+            return {"success": False, "error": f"Error: {sanitized}"}
+        out_bytes, out_mime = sanitized
+
+        b64 = base64.b64encode(out_bytes).decode("utf-8")
         return {
             "success": True,
             "type": "image",
             "data": b64,
-            "mime_type": effective_mime,
-            "text": f"Read image file [{effective_mime}]",
+            "mime_type": out_mime,
+            "text": f"Read image file [{out_mime}]",
         }
 
     # -- text branch --

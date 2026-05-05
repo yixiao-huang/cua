@@ -29,11 +29,16 @@ Reference:
 from __future__ import annotations
 
 import asyncio
+import base64 as _base64
 import inspect
 import json
 import re
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
+from .image_sanitization import (
+    DEFAULT_LIMITS as _IMAGE_DEFAULT_LIMITS,
+    sanitize_raw_image_bytes as _sanitize_raw_image_bytes,
+)
 from agent.agent import ComputerAgent, assert_callable_with, get_json, get_output_call_ids
 from agent.computers.base import AsyncComputerHandler
 from agent.computers.cua import cuaComputerHandler
@@ -76,6 +81,30 @@ from .session import (
     should_run_memory_flush,
 )
 from .subagent_registry import SubagentRegistry
+
+
+def _maybe_sanitize_screenshot(b64: str) -> tuple[str, str]:
+    """Resize/transcode a base64-encoded screenshot per OpenClaw image limits.
+
+    Returns ``(out_b64, out_mime)``. On any failure to sanitize (decode error,
+    exhausted resize grid), falls back to the original PNG to keep the run
+    alive — the sanitizer is defensive, not strict. Mirrors the per-tool
+    wrap pattern used by ReadFileTool / AnalyzeImageTool.
+    """
+    try:
+        raw = _base64.b64decode(b64, validate=False)
+    except Exception:  # noqa: BLE001
+        return b64, "image/png"
+    sanitized = _sanitize_raw_image_bytes(
+        raw, "image/png", label="screenshot", limits=_IMAGE_DEFAULT_LIMITS
+    )
+    if isinstance(sanitized, str):
+        # Placeholder string — sanitizer gave up. Pass the original through.
+        return b64, "image/png"
+    out_bytes, out_mime = sanitized
+    if out_bytes is raw:
+        return b64, out_mime
+    return _base64.b64encode(out_bytes).decode("ascii"), out_mime
 
 
 def _rewrite_input_image_to_image_url(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -841,7 +870,10 @@ class OpenClawComputerAgent(ComputerAgent):
         if self.screenshot_delay and self.screenshot_delay > 0:
             await asyncio.sleep(self.screenshot_delay)
         screenshot_base64 = await computer.screenshot()
-        await self._on_screenshot(screenshot_base64, "screenshot_after")
+        # US-OC-070: resize/transcode if the screenshot exceeds OpenClaw's
+        # 5 MB / 1200 px / 25 MP limits before it enters the transcript.
+        sanitized_b64, sanitized_mime = _maybe_sanitize_screenshot(screenshot_base64)
+        await self._on_screenshot(sanitized_b64, "screenshot_after")
 
         # ``action="screenshot"`` returns raw base64 — short-circuit so we
         # don't dump 58K tokens of base64 into the tool-text channel (and
@@ -861,7 +893,7 @@ class OpenClawComputerAgent(ComputerAgent):
             "content": [
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{screenshot_base64}"},
+                    "image_url": {"url": f"data:{sanitized_mime};base64,{sanitized_b64}"},
                 }
             ],
         }

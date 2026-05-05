@@ -24,6 +24,8 @@ import litellm
 
 from agent.tools.base import BaseTool, register_tool
 
+from .image_sanitization import ImageLimits, sanitize_raw_image_bytes
+
 if TYPE_CHECKING:
     from computer.interface import BaseComputerInterface
 
@@ -252,17 +254,23 @@ class AnalyzeImageTool(BaseTool):
         if not image_bytes:
             return f"Error: file is empty: {image_ref}"
 
-        # Size enforcement
-        if max_bytes is not None and len(image_bytes) > max_bytes:
-            actual_mb = len(image_bytes) / (1024 * 1024)
-            limit_mb = max_bytes / (1024 * 1024)
-            return (
-                f"Error: image too large ({actual_mb:.1f} MB), "
-                f"maximum is {limit_mb:.0f} MB: {image_ref}"
-            )
+        # Resize/transcode oversized images instead of hard-rejecting (US-OC-070).
+        # Per-call max_bytes overrides the OpenClaw default (5 MB); other limits
+        # (1200 px, 25 MP) come from ImageLimits defaults.
+        limits = (
+            ImageLimits(max_bytes=int(max_bytes))
+            if max_bytes is not None and max_bytes > 0
+            else ImageLimits()
+        )
+        sanitized = sanitize_raw_image_bytes(
+            image_bytes, mime_type, label=f"analyze_image:{image_ref}", limits=limits
+        )
+        if isinstance(sanitized, str):
+            return f"Error: {sanitized}"
+        out_bytes, out_mime = sanitized
 
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        return (b64, mime_type)
+        b64 = base64.b64encode(out_bytes).decode("utf-8")
+        return (b64, out_mime)
 
     @staticmethod
     async def _fetch_http(url: str) -> tuple[bytes, str]:
