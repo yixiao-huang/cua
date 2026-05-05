@@ -870,7 +870,7 @@ class OpenClawComputerAgent(ComputerAgent):
         if self.screenshot_delay and self.screenshot_delay > 0:
             await asyncio.sleep(self.screenshot_delay)
         screenshot_base64 = await computer.screenshot()
-        # US-OC-070: resize/transcode if the screenshot exceeds OpenClaw's
+        # US-OC-073: resize/transcode if the screenshot exceeds OpenClaw's
         # 5 MB / 1200 px / 25 MP limits before it enters the transcript.
         sanitized_b64, sanitized_mime = _maybe_sanitize_screenshot(screenshot_base64)
         await self._on_screenshot(sanitized_b64, "screenshot_after")

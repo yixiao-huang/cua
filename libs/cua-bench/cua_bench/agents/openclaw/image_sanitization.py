@@ -1,4 +1,4 @@
-"""Image sanitization (resize/transcode) — US-OC-070.
+"""Image sanitization (resize/transcode) — US-OC-073.
 
 Mirrors OpenClaw's image-sanitization chokepoint so oversize / over-dimension
 images are downsized and transcoded to JPEG instead of being hard-rejected.
@@ -16,13 +16,13 @@ Reference (target behavior):
       `IMAGE_REDUCE_QUALITY_STEPS = [85, 75, 65, 55, 45, 35]`,
       `MAX_IMAGE_INPUT_PIXELS = 25_000_000`.
 
-Fidelity-preserving by design (US-OC-070):
+Fidelity-preserving by design (US-OC-073):
   An image whose MIME is not in the provider allowlist (e.g. `image/bmp`,
   `image/tiff`, `image/avif`) but whose bytes/dimensions are within the
   limits is **passed through unchanged**, matching OpenClaw's early-return
   at tool-images.ts:170-183. This is a known upstream gap — the provider
   will 400 on such images. The fix (force-transcode any non-allowlisted
-  MIME) is tracked separately as US-OC-071 and is potentially upstreamable
+  MIME) is tracked separately as US-OC-074 and is potentially upstreamable
   to OpenClaw.
 """
 

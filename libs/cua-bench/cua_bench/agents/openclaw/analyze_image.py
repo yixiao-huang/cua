@@ -254,7 +254,7 @@ class AnalyzeImageTool(BaseTool):
         if not image_bytes:
             return f"Error: file is empty: {image_ref}"
 
-        # Resize/transcode oversized images instead of hard-rejecting (US-OC-070).
+        # Resize/transcode oversized images instead of hard-rejecting (US-OC-073).
         # Per-call max_bytes overrides the OpenClaw default (5 MB); other limits
         # (1200 px, 25 MP) come from ImageLimits defaults.
         limits = (
